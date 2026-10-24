@@ -63,7 +63,7 @@ class _CalcDialogState extends State<_CalcDialog> {
       ]),
       actions: [
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
-        FilledButton(onPressed: ok ? () => Navigator.pop(context, result!.toDouble()) : null, child: const Text('Pakai')),
+        FilledButton(onPressed: ok ? () => Navigator.pop(context, result.toDouble()) : null, child: const Text('Pakai')),
       ],
     );
   }
