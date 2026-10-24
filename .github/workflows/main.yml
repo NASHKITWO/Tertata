@@ -1,0 +1,167 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Pustaka SQLite untuk tes
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Naikkan compileSdk semua plugin ke 36
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/compilesdk.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              def ext = p.extensions.findByName('android')
+              if (ext != null) {
+                try {
+                  def cur = ext.compileSdk
+                  if (cur == null || cur < 36) { ext.compileSdk = 36 }
+                } catch (Throwable e1) {
+                  try { ext.compileSdkVersion(36) } catch (Throwable e2) { }
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Siapkan proyek (android/ios + konfigurasi native + penandatanganan rilis)
+        run: python3 tool/bootstrap.py
+
+      - name: Siapkan keystore rilis
+        env:
+          KS: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KS" | base64 -d > android/release-keystore.jks
+            {
+              echo "storePassword=$STORE_PASSWORD"
+              echo "keyPassword=$KEY_PASSWORD"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "storeFile=release-keystore.jks"
+            } > android/key.properties
+            echo "RELEASE_SIGNING_CONFIGURED=true" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "::error::Rilis bertag wajib memakai RELEASE_KEYSTORE_BASE64, RELEASE_STORE_PASSWORD, RELEASE_KEY_ALIAS, dan RELEASE_KEY_PASSWORD."
+            exit 1
+          else
+            echo "::warning::Secret keystore rilis belum lengkap; APK ini ditandatangani kunci debug dan tidak boleh dibagikan publik."
+            echo "RELEASE_SIGNING_CONFIGURED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Unduh paket
+        run: flutter pub get
+
+      - name: Analisis kode
+        run: flutter analyze --no-fatal-infos
+
+      - name: Tes
+        run: flutter test
+
+      - name: Build APK rilis
+        run: flutter build apk --release --no-shrink
+
+      - name: Build AAB rilis (untuk Google Play)
+        continue-on-error: true
+        run: flutter build appbundle --release
+
+      - name: Verifikasi tanda tangan, izin, dan hash APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            grep -q "tertataKeyFile" android/app/build.gradle* || {
+              echo "::error::build.gradle belum membaca key.properties; APK akan bertanda tangan debug. Jalankan ulang tool/setup_native.py."
+              exit 1
+            }
+          fi
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$APKSIGNER"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee apk-certs.txt
+
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          test -n "$AAPT"
+          "$AAPT" dump permissions "$APK" | tee apk-permissions.txt
+          sha256sum "$APK" | tee apk-sha256.txt
+
+      - name: Beri nama berkas APK sesuai versi
+        run: |
+          VER=$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')
+          cp build/app/outputs/flutter-apk/app-release.apk "Tertata-v${VER}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk Tertata.apk
+          echo "APK_FILE=Tertata-v${VER}.apk" >> "$GITHUB_ENV"
+          AAB=build/app/outputs/bundle/release/app-release.aab
+          if [ -f "$AAB" ]; then
+            cp "$AAB" "Tertata-v${VER}.aab"
+          fi
+
+      - name: Hapus keystore dari runner
+        if: always()
+        run: rm -f android/release-keystore.jks android/key.properties
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tertata-apk
+          path: |
+            ${{ env.APK_FILE }}
+            Tertata.apk
+            Tertata-v*.aab
+            apk-certs.txt
+            apk-permissions.txt
+            apk-sha256.txt
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tertata-apk
+      - name: Terbitkan Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Tertata-v*.apk
+            Tertata.apk
+            apk-sha256.txt
+            apk-permissions.txt
+          generate_release_notes: true
+          draft: true
