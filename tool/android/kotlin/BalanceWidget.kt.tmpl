@@ -1,0 +1,63 @@
+package __PACKAGE__
+
+import android.app.PendingIntent
+import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProvider
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.widget.RemoteViews
+import org.json.JSONObject
+
+/** Widget layar utama: saldo, pengeluaran bulan ini, dan tombol "Catat". Data diisi dari aplikasi. */
+class BalanceWidget : AppWidgetProvider() {
+    override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
+        for (id in appWidgetIds) appWidgetManager.updateAppWidget(id, build(context))
+    }
+
+    companion object {
+        private const val PREFS = "tertata_widget"
+
+        fun save(ctx: Context, json: String) {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("data", json).apply()
+            refresh(ctx)
+        }
+
+        fun refresh(ctx: Context) {
+            val mgr = AppWidgetManager.getInstance(ctx)
+            val ids = mgr.getAppWidgetIds(ComponentName(ctx, BalanceWidget::class.java))
+            for (id in ids) mgr.updateAppWidget(id, build(ctx))
+        }
+
+        private fun open(ctx: Context, code: Int, action: String?): PendingIntent {
+            val i = Intent(ctx, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            if (action != null) i.putExtra(MainActivity.EXTRA_ACTION, action)
+            return PendingIntent.getActivity(ctx, code, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        }
+
+        private fun build(ctx: Context): RemoteViews {
+            val v = RemoteViews(ctx.packageName, R.layout.tertata_widget_balance)
+            val raw = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("data", null)
+            var balance = "Buka Tertata"
+            var detail = ""
+            var perDay = ""
+            if (raw != null) {
+                try {
+                    val o = JSONObject(raw)
+                    balance = o.optString("balance", balance)
+                    detail = o.optString("detail", "")
+                    perDay = o.optString("perDay", "")
+                } catch (e: Exception) {
+                    // data rusak: tampilkan bawaan
+                }
+            }
+            v.setTextViewText(R.id.tw_balance, balance)
+            v.setTextViewText(R.id.tw_detail, detail)
+            v.setTextViewText(R.id.tw_perday, perDay)
+            v.setOnClickPendingIntent(R.id.tw_root, open(ctx, 1, null))
+            v.setOnClickPendingIntent(R.id.tw_add, open(ctx, 2, "quick_add"))
+            return v
+        }
+    }
+}

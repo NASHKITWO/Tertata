@@ -1,0 +1,24 @@
+package __PACKAGE__
+
+import android.app.Notification
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+
+/** Membaca notifikasi masuk dan menyerahkannya ke [NotifInbox], yang menyaring dan menyimpannya secara lokal. */
+class TertataNotifListener : NotificationListenerService() {
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        try {
+            val s = sbn ?: return
+            val pkg = s.packageName ?: return
+            if (pkg == packageName) return
+            val n = s.notification ?: return
+            if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+            val ex = n.extras ?: return
+            val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+            val body = (ex.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: ex.getCharSequence(Notification.EXTRA_TEXT))?.toString() ?: ""
+            NotifInbox.offer(this, pkg, title, body, s.postTime)
+        } catch (e: Exception) {
+            // Jangan sampai gangguan di sini menjatuhkan layanan.
+        }
+    }
+}

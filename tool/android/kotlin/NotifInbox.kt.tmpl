@@ -1,0 +1,150 @@
+package __PACKAGE__
+
+import android.content.ComponentName
+import android.content.Context
+import android.provider.Settings
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * Kotak masuk notifikasi transaksi. Hanya notifikasi dari aplikasi bank/e-wallet di [APP_PACKAGES]
+ * (dan aplikasi SMS di [SMS_PACKAGES] bila pengguna mengaktifkannya) yang memuat nominal rupiah dan
+ * kata kunci transaksi yang disimpan. Semua tersimpan lokal di perangkat; tidak ada yang dikirim keluar.
+ * Daftar paket di bawah adalah perkiraan terbaik; tambahkan paket aplikasi Anda bila belum ada.
+ */
+object NotifInbox {
+    private const val PREFS = "tertata_inbox"
+    private const val KEY_ITEMS = "items"
+    private const val KEY_SMS = "sms"
+    private const val MAX_ITEMS = 100
+    private const val EXPIRE_MS = 14L * 24 * 60 * 60 * 1000
+    private const val DEDUPE_MS = 10L * 60 * 1000
+
+    val APP_PACKAGES = setOf(
+        "com.gojek.app", "com.gojek.gopay", "ovo.id", "id.dana", "com.shopee.id", "com.telkom.mwallet",
+        "com.bca", "com.bca.mybca.omni.android", "id.bmri.livin", "src.com.bni", "id.co.bri.brimo",
+        "com.jago.digitalBanking", "com.bsm.activity2", "com.btpn.dc", "com.bcadigital.blu",
+        "id.co.cimbniaga.mobile.android", "id.flip", "net.myinfosys.PermataMobileX"
+    )
+    val SMS_PACKAGES = setOf(
+        "com.google.android.apps.messaging", "com.samsung.android.messaging", "com.android.mms",
+        "com.android.messaging", "com.miui.mms"
+    )
+
+    private val amountRe = Regex("(?i)\\b(rp|idr)\\.?\\s*[0-9]")
+    // Jangan simpan notifikasi yang tampak memuat OTP, kredensial, atau kode autentikasi.
+    // Ini adalah penyaring konservatif; bukan pengganti pengujian privasi pada perangkat nyata.
+    private val sensitiveContent = Regex(
+        "(?i)(\\botp\\b|one[ -]?time password|verification code|security code|kode verifikasi|kode otp|kata sandi|password|passcode|pin anda|your pin|jangan berikan kode|do not share (?:this )?code)"
+    )
+    private const val MAX_TEXT_LENGTH = 1200
+
+    // Deret 10+ angka berurutan (nomor rekening, kartu, referensi) disamarkan menjadi ••••1234 sebelum
+    // disimpan. Angka yang langsung mengikuti "Rp"/"IDR" dianggap nominal dan dibiarkan.
+    private val longDigits = Regex("[0-9]{10,}")
+
+    internal fun maskLongDigits(text: String): String =
+        longDigits.replace(text) { m ->
+            val before = text.substring(maxOf(0, m.range.first - 6), m.range.first).lowercase()
+            if (before.contains("rp") || before.contains("idr")) m.value
+            else "\u2022\u2022\u2022\u2022" + m.value.takeLast(4)
+        }
+
+    private val keywords = listOf(
+        "transfer", "pembayaran", "membayar", "berhasil", "menerima", "diterima", "dana masuk", "uang masuk",
+        "debit", "kredit", "top up", "topup", "tarik tunai", "payment", "purchase", "received", "transaksi", "bayar"
+    )
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun isAccessEnabled(ctx: Context): Boolean {
+        val flat = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners") ?: return false
+        return flat.split(":").any { ComponentName.unflattenFromString(it)?.packageName == ctx.packageName }
+    }
+
+    fun smsEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_SMS, false)
+
+    fun setSms(ctx: Context, on: Boolean) {
+        prefs(ctx).edit().putBoolean(KEY_SMS, on).apply()
+    }
+
+    private fun load(ctx: Context): JSONArray =
+        try {
+            JSONArray(prefs(ctx).getString(KEY_ITEMS, "[]"))
+        } catch (e: Exception) {
+            JSONArray()
+        }
+
+    private fun save(ctx: Context, arr: JSONArray) {
+        prefs(ctx).edit().putString(KEY_ITEMS, arr.toString()).apply()
+    }
+
+    /** Menyimpan notifikasi bila lolos saringan. Mengembalikan true jika disimpan. */
+    @Synchronized
+    fun offer(ctx: Context, pkg: String, title: String, body: String, time: Long): Boolean {
+        val allowed = pkg in APP_PACKAGES || (pkg in SMS_PACKAGES && smsEnabled(ctx))
+        if (!allowed) return false
+        val text = (if (title.isNotBlank() && !body.startsWith(title)) "$title: $body" else body).trim()
+        if (text.isEmpty()) return false
+        // Batasi panjang input agar notifikasi panjang/aneh tidak disimpan tanpa batas.
+        if (text.length > MAX_TEXT_LENGTH) return false
+        if (sensitiveContent.containsMatchIn(text)) return false
+        val low = text.lowercase()
+        if (!amountRe.containsMatchIn(low)) return false
+        if (keywords.none { low.contains(it) }) return false
+
+        val stored = maskLongDigits(text)
+        val now = System.currentTimeMillis()
+        val old = load(ctx)
+        val fresh = JSONArray()
+        for (i in 0 until old.length()) {
+            val o = old.optJSONObject(i) ?: continue
+            val t = o.optLong("time")
+            if (now - t > EXPIRE_MS) continue
+            if (o.optString("pkg") == pkg && o.optString("text") == stored && now - t < DEDUPE_MS) return false
+            fresh.put(o)
+        }
+        fresh.put(
+            JSONObject()
+                .put("id", "$time-" + Integer.toHexString(text.hashCode()))
+                .put("pkg", pkg)
+                .put("text", stored)
+                .put("time", time)
+        )
+        val out = JSONArray()
+        val start = maxOf(0, fresh.length() - MAX_ITEMS)
+        for (i in start until fresh.length()) out.put(fresh.get(i))
+        save(ctx, out)
+        return true
+    }
+
+    @Synchronized
+    fun pendingJson(ctx: Context): String {
+        val now = System.currentTimeMillis()
+        val keep = JSONArray()
+        val all = load(ctx)
+        for (i in 0 until all.length()) {
+            val o = all.optJSONObject(i) ?: continue
+            if (now - o.optLong("time") <= EXPIRE_MS) keep.put(o)
+        }
+        if (keep.length() != all.length()) save(ctx, keep)
+        return keep.toString()
+    }
+
+    @Synchronized
+    fun remove(ctx: Context, ids: List<String>) {
+        val drop = ids.toSet()
+        val all = load(ctx)
+        val keep = JSONArray()
+        for (i in 0 until all.length()) {
+            val o = all.optJSONObject(i) ?: continue
+            if (o.optString("id") !in drop) keep.put(o)
+        }
+        save(ctx, keep)
+    }
+
+    @Synchronized
+    fun clear(ctx: Context) {
+        prefs(ctx).edit().remove(KEY_ITEMS).apply()
+    }
+}
